@@ -1,0 +1,8 @@
+        (a(b))),V
+nnoremap <right> <nop>,V
+),v
+qsdkqmsldkqsmldkqsmlkdqmslkd,V
+" Use the damn hjkl keysnnoremap <up> <nop>nnoremap <down> <nop>nnoremap <left> <nop>,V
+,V
+Menlo-ForPowerline.ttc,v
+21515216 lrwxr-xr-x     1 greg  staff      38 Aug  8 13:46 .vimrc -> /Users/greg/projects/vim_config/.vimrc,v

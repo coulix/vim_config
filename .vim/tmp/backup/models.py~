@@ -1,0 +1,1263 @@
+#-*- coding: utf-8 -*-
+
+from django.db import models
+from django.conf import settings
+from django.core.files.base import File
+from django.core.urlresolvers import reverse
+from django.utils.timezone import now
+from django.utils.translation import ugettext_lazy as _
+from django.template.defaultfilters import slugify
+
+from rh2.apps.core.mail_factory import MailFactory
+from rh2.apps.distribution import signals
+from rh2.apps.delivery.models import DeliveryPaperConfiguration
+from rh2.apps.distribution.tasks import delete_docs
+from rh2.apps.distribution.tasks import build_campaigns
+from rh2.apps.document.tasks import archive_docs_on_sae
+from rh2.apps.importer.tools import UnicodeWriter
+from rh2.apps.notification import models as notification
+from rh2.apps.role.models import Role
+from rh2.apps.preferences.models import RH2Site
+from rh2.services.delivery import DeliveryService
+from rh2.services.flow import FlowService
+from rh2.services.sae import SAEService
+from rh2.services.sae import SAEError
+
+from django_fsm.db.fields import FSMField, transition
+from extended_choices import Choices
+from djqmixin import Manager
+from jsonfield.fields import JSONField
+
+import uuid
+import tempfile
+
+import logging
+logger = logging.getLogger('peopledoc')
+
+
+DISTRIBUTION_CHOICES = Choices(
+    ('EMPLOYEES_ONLY', 1, _('Employees only')),
+    ('ENTERPRISE_ONLY', 2, _('Employers only')),
+    ('ENTERPRISE_AND_EMPLOYEE', 3, _('Employers & Employees')),
+)
+
+VALIDATION_CHOICES = Choices(
+    ('NOW', 0, _("Immediatly after project validation")),
+    ('ONE_DAY', 1, _("1 day after project validation")),
+    ('TWO_DAYS', 2, _("2 day after project validation")),
+    ('THREE_DAYS', 3, _("3 days after project validation")),
+    ('SEVEN_DAYS', 7, _("7 days after project validation")),
+    ('TEN_DAYS', 10, _("10 days after project validation")),
+)
+
+DELIVERY_OPTIONS = Choices(
+    ('PARCEL', 'parcel', _("Parcel delivery")),
+    ('PERSONAL', 'personal', _("Personal delivery")),
+)
+
+# TODO one day, move DEMAT to an integer list choice
+DEMAT = Choices(
+    ('ELECTRONIC', True, _('Electronic')),
+    ('PAPER', False, _('Paper')),
+)
+
+DISTRIB_RECEIVERS = Choices(
+    ('NONE', 0, _('Do not send anything')),
+    ('EMPLOYEES', 1, _('Employees only (CFE)')),
+    ('ENTERPRISE', 2, _('Enterprise only (DsD)')),
+    ('ENMPLOYEE_AND_ENTERPRISE', 3, _('Both')),
+)
+
+DISTRIB_MEDIAS = Choices(
+    ('NONE', 0, _('None')),
+    ('ELECTRONIC', 1, _('Electronic')),
+    ('PAPER', 2, _('Paper')),
+    ('ELECTRONIC_AND_PAPER', 3, _('Both')),
+)
+
+DISTRIB_STATES = Choices(
+    ('NEW', 'NEW', _('New')),
+    ('FLOW_PENDING', 'FLOW_PENDING', _('Flow validation pending')),
+    ('FLOW_ERROR', 'FLOW_ERROR', _('Flow validation error')),
+    ('INTEGRATING_DOCS_TO_PEOPLEDOC', 'INTEGRATING_DOCS_TO_PEOPLEDOC', _('Integrating documents')),
+    ('MANAGER_PENDING', 'MANAGER_PENDING', _('Manager validation pending')),
+    ('READY', 'READY', _('Ready to be confirmed')),
+    ('CANCELED', 'CANCELED', _('Canceled')),
+    ('BUILDING_CAMPAIGNS', 'BUILDING_CAMPAIGNS', _('Building campaigns')),
+    ('CAMPAIGN_ERROR', 'CAMPAIGN_ERROR', _('Campaign error')),
+    ('SENDING', 'SENDING', _('Sending notification')),
+    ('DONE', 'DONE', _('Done')),
+)
+DISTRIB_STATES.add_subset('DELETABLE_STATES',
+                          ('NEW',
+                           'FLOW_PENDING',
+                           'FLOW_ERROR',
+                           'INTEGRATING_DOCS_TO_PEOPLEDOC',
+                           'MANAGER_PENDING',
+                           'CANCELED',))
+DISTRIB_STATES.add_subset('DISTRIB_ADDABLE_STATES',
+                          ('NEW',
+                           'FLOW_PENDING',
+                           'FLOW_ERROR',
+                           'INTEGRATING_DOCS_TO_PEOPLEDOC',
+                           'MANAGER_PENDING',))
+
+DISTRIB_SUBSET_CHOICES = Choices(
+    ('PENDING_STATES', 'PENDING_STATES', _('In progress')),
+    ('DONE_STATES', 'DONE_STATES', _('Done')),
+)
+DISTRIB_STATES.add_subset(DISTRIB_SUBSET_CHOICES.DONE_STATES,
+                          ('DONE',
+                           'CANCELED',))
+DISTRIB_STATES.add_subset(DISTRIB_SUBSET_CHOICES.PENDING_STATES,
+                          ('NEW',
+                           'FLOW_PENDING',
+                           'FLOW_ERROR',
+                           'INTEGRATING_DOCS_TO_PEOPLEDOC',
+                           'MANAGER_PENDING',
+                           'READY',
+                           'BUILDING_CAMPAIGNS',
+                           'CAMPAIGN_ERROR',
+                           'SENDING',))
+
+DISTRIB_STATES_CSS_MAP = {
+    DISTRIB_STATES.NEW: '-inverse',
+    DISTRIB_STATES.FLOW_PENDING: '-success',
+    DISTRIB_STATES.FLOW_ERROR: '-important',
+    DISTRIB_STATES.INTEGRATING_DOCS_TO_PEOPLEDOC: '-success',
+    DISTRIB_STATES.MANAGER_PENDING: '-warning',
+    DISTRIB_STATES.READY: '-warning',
+    DISTRIB_STATES.CANCELED: '',
+    DISTRIB_STATES.BUILDING_CAMPAIGNS: '-success',
+    DISTRIB_STATES.CAMPAIGN_ERROR: '-important',
+    DISTRIB_STATES.SENDING: '-success',
+    DISTRIB_STATES.DONE: '-info',
+}
+
+DISTRIB_STATES_FLOW = [
+    DISTRIB_STATES.FLOW_PENDING,
+    DISTRIB_STATES.INTEGRATING_DOCS_TO_PEOPLEDOC,
+    DISTRIB_STATES.MANAGER_PENDING,
+    DISTRIB_STATES.READY,
+    DISTRIB_STATES.BUILDING_CAMPAIGNS,
+    DISTRIB_STATES.SENDING,
+]
+
+
+class DistributionMixins(object):
+    @property
+    def state_css(self):
+        return DISTRIB_STATES_CSS_MAP[self.state]
+
+    @property
+    def state_flow(self):
+        if self.state not in DISTRIB_STATES_FLOW:
+            return None
+        return DISTRIB_STATES_FLOW.index(self.state) + 1, [(state, DISTRIB_STATES.CHOICES_DICT[state]) for state in DISTRIB_STATES_FLOW]
+
+    def get_managers_to_notice(self):
+        from rh2.apps.account.models import RH2User
+        return list(RH2User.objects.managers().filter(profile__site=self.site,
+                                                      orgprofile__role__permissions__codename='manage_distribs').distinct())
+
+    def is_canceled(self):
+        return self.state == DISTRIB_STATES.CANCELED
+
+    def is_done(self):
+        return self.state == DISTRIB_STATES.DONE
+
+    def is_deletable(self):
+        return self.is_deleted == False and self.state in DISTRIB_STATES.DELETABLE_STATES_DICT
+
+    def count_all_docs(self):
+        return self.get_all_docs().count()
+
+    def get_error_docs(self):
+        from rh2.apps.document.models import DISTRIB_DOC_STATUS
+        return self.get_all_docs().filter(
+            distribution_status=DISTRIB_DOC_STATUS.ERROR
+        )
+
+    def count_error_docs(self):
+        return self.get_error_docs().count()
+
+    def count_error_not_solved_docs(self):
+        return self.get_error_docs().filter(
+            distribution_error_solved_date__isnull=True,
+        ).count()
+
+    def count_error_solved_docs(self):
+        return self.get_error_docs().filter(
+            distribution_error_solved_date__isnull=False,
+        ).count()
+
+    def get_enterprise_copies(self):
+        """
+        Return all enterprise copies docs.
+        - success True
+        - origin ENTERPRISE_DISTRIB
+        """
+        from rh2.apps.document.models import DOC_ORIGIN, DISTRIB_DOC_STATUS
+        return self.get_all_docs().filter(
+            origin=DOC_ORIGIN.ENTERPRISE_DISTRIB,
+            distribution_status=DISTRIB_DOC_STATUS.SUCCESS,
+        )
+
+    def get_electronic_employee_doc_copies(self, include_original=True):
+        """
+        Return all employee copies docs.
+        - success True or False (as we want to turn the 'solved' document visible for the
+        employee).
+        - ELECTRONIC
+        - origin EMPLOYEE_DISTRIB
+        """
+        from rh2.apps.document.models import DOC_FORMAT, DOC_ORIGIN
+        qs = self.get_all_docs().filter(
+            format=DOC_FORMAT.ELECTRONIC,
+            origin=DOC_ORIGIN.EMPLOYEE_DISTRIB,
+        )
+        if not include_original:
+            qs.filter(is_original=False)
+        return qs
+
+    def get_paper_employee_doc_copies(self):
+        """
+        Return all employee copies docs.
+        - success True
+        - PAPER
+        - origin EMPLOYEE_DISTRIB
+        - is_original True
+        """
+        from rh2.apps.document.models import DOC_FORMAT, DOC_ORIGIN, DISTRIB_DOC_STATUS
+        return self.get_all_docs().filter(
+            format=DOC_FORMAT.PAPER,
+            origin=DOC_ORIGIN.EMPLOYEE_DISTRIB,
+            distribution_status=DISTRIB_DOC_STATUS.SUCCESS,
+            is_original=True,
+        )
+
+    def _get_billing_size_slices(self, qs):
+        """
+        Return number of document, regroup by size slices.
+        """
+        if qs.exists():
+            # get max in bytes
+            size_max = qs.aggregate(models.Max('size'))['size__max']
+            # get last slice
+            ko_slice = 50 * 1024
+            ko_max = size_max / ko_slice
+            if (size_max / 1024) % 50 != 0:
+                ko_max += 1
+            # count by slices
+            result = []
+            for ko in range(1, ko_max + 1):
+                count = qs.filter(size__range=((ko - 1) * ko_slice,
+                                                  ko * ko_slice)).count()
+                if count:
+                    result.append({'slice': ko * 50,
+                                   'count': count})
+            return result
+
+    def get_billing_electronic_enterprise_docs(self):
+        from rh2.apps.document.models import DOC_FORMAT, DOC_ORIGIN, DISTRIB_DOC_STATUS
+        return self._get_billing_size_slices(self.get_all_docs().filter(
+            format=DOC_FORMAT.ELECTRONIC,
+            origin=DOC_ORIGIN.ENTERPRISE_DISTRIB,
+            distribution_status=DISTRIB_DOC_STATUS.SUCCESS,
+        ))
+
+    def get_billing_electronic_employee_original_docs(self):
+        from rh2.apps.document.models import DOC_FORMAT, DOC_ORIGIN, DISTRIB_DOC_STATUS
+        return self._get_billing_size_slices(self.get_all_docs().filter(
+            format=DOC_FORMAT.ELECTRONIC,
+            origin=DOC_ORIGIN.EMPLOYEE_DISTRIB,
+            distribution_status=DISTRIB_DOC_STATUS.SUCCESS,
+            is_original=True
+        ))
+
+    def get_billing_electronic_employee_copy_docs(self):
+        from rh2.apps.document.models import DOC_FORMAT, DOC_ORIGIN, DISTRIB_DOC_STATUS
+        return self._get_billing_size_slices(self.get_all_docs().filter(
+            format=DOC_FORMAT.ELECTRONIC,
+            origin=DOC_ORIGIN.EMPLOYEE_DISTRIB,
+            distribution_status=DISTRIB_DOC_STATUS.SUCCESS,
+            is_original=False
+        ))
+
+    def get_billing_paper_employee_docs(self):
+        """
+        Return number of mails sent, regroup by pages number.
+        """
+        logs = self.get_all_delivery_logs()
+        return logs.values('doc_pages').annotate(models.Count('doc_pages')).order_by('doc_pages')
+
+
+class Project(models.Model, DistributionMixins):
+    name = models.CharField(_("title"), max_length=50)
+    validation_option = models.IntegerField(_('notifications delivery'),
+                                            help_text=_('valid for employees documents only.'),
+                                            choices=VALIDATION_CHOICES.CHOICES)
+    delivery_paper_conf = models.ForeignKey(DeliveryPaperConfiguration,
+                                            verbose_name=_('delivery paper conf'),
+                                            limit_choices_to={'site': RH2Site.objects.get_current})
+    regroup_paper_mailing = models.BooleanField(_('regroup paper mailing'),
+                                                help_text=_("Only one paper mail including all documents with type 'paper' "
+                                                            "of each distribution will be sent to employees."))
+
+    state = FSMField(_('state'),
+                     choices=DISTRIB_STATES.CHOICES,
+                     default=DISTRIB_STATES.NEW,
+                     db_index=True)
+
+    cdate = models.DateTimeField(_('creation date'), auto_now_add=True)
+    udate = models.DateTimeField(_('update date'), auto_now=True)
+    is_deleted = models.BooleanField(default=False, db_index=True)
+
+    validated_date = models.DateTimeField(blank=True, null=True)
+    is_mail_campaign_done = models.BooleanField(default=False)
+    # While we are processing the project validation
+    # 'tasks/process_pending_campaigns' which is done by a scheduled task every 30s.
+    # we do not want the task to pickup the same project again.
+    # Using a lock helps us to keep it safe from
+    # being processed several time.
+    is_locked = models.BooleanField(default=False, editable=False)
+
+    site = models.ForeignKey(RH2Site, default=RH2Site.objects.get_current, editable=False)
+
+    def __unicode__(self):
+        return self.name
+
+    class Meta:
+        ordering = ['-cdate']
+
+    @property
+    def delivery_option(self):
+        return self.delivery_paper_conf.package_ref and DELIVERY_OPTIONS.PARCEL or DELIVERY_OPTIONS.PERSONAL
+
+    def get_delivery_option_display(self):
+        return DELIVERY_OPTIONS.CHOICES_DICT[self.delivery_option]
+
+    def is_ready(self):
+        return self.state == DISTRIB_STATES.READY
+
+    def is_distrib_addable(self):
+        return self.state in DISTRIB_STATES.DISTRIB_ADDABLE_STATES_DICT
+
+    def is_regroupable(self):
+        """
+        Do not try to regroup mailing if there is no not CANCELED and not deleted distrib.
+        """
+        return self.regroup_paper_mailing and self.get_all_distribs().exclude(state=DISTRIB_STATES.CANCELED).exists()
+
+    def get_all_docs(self):
+        """
+        Return a Document queryset
+        - document linked to distributions of the project
+        - distribution is not deleted
+        - distribution is not canceled
+        - employee document
+        - document is not deleted
+        """
+        from rh2.apps.document.models import Document, DOC_ORIGIN, DOC_TYPE_CATEGORIES
+        return Document.objects.filter(distribution__project=self,
+                                       distribution__is_deleted=False,
+                                       origin__in=DOC_ORIGIN.PEOPLEDOC_DISTRIB_DICT.keys(),
+                                       doc_type__category=DOC_TYPE_CATEGORIES.EMPLOYEE,
+                                       date_delete__isnull=True,
+                                       site=self.site
+                               ).exclude(distribution__state=DISTRIB_STATES.CANCELED)
+
+    def get_all_delivery_logs(self):
+        """
+        Return all delivery logs for the project.
+        """
+        return DeliveryMailLog.objects.filter(campaign__project=self)
+
+    def get_all_distribs(self):
+        return self.distribution_set.filter(
+            is_deleted=False,
+        )
+
+    def get_done_distributions(self):
+        return self.get_all_distribs().filter(
+            state=DISTRIB_STATES.DONE,
+        )
+
+    def update_state(self):
+        """
+        Update self.state depending on distribs
+        """
+        queryset = self.get_all_distribs()
+        if queryset.filter(state=DISTRIB_STATES.FLOW_ERROR).exists():
+            # if at least one distrib is FLOW_ERROR
+            self.state = DISTRIB_STATES.FLOW_ERROR
+        if queryset.filter(state=DISTRIB_STATES.CAMPAIGN_ERROR).exists():
+            # if at least one distrib is CAMPAIGN_ERROR
+            self.state = DISTRIB_STATES.CAMPAIGN_ERROR
+        elif queryset.filter(state=DISTRIB_STATES.FLOW_PENDING).exists():
+            # if at least one distrib is FLOW_PENDING
+            self.state = DISTRIB_STATES.FLOW_PENDING
+        elif queryset.filter(state=DISTRIB_STATES.INTEGRATING_DOCS_TO_PEOPLEDOC).exists():
+            # if at least one distrib is INTEGRATING_DOCS_TO_PEOPLEDOC
+            self.state = DISTRIB_STATES.INTEGRATING_DOCS_TO_PEOPLEDOC
+        elif queryset.filter(state=DISTRIB_STATES.MANAGER_PENDING).exists():
+            # if at least one distrib is MANAGER_PENDING
+            self.state = DISTRIB_STATES.MANAGER_PENDING
+        elif not queryset.exclude(state=DISTRIB_STATES.CANCELED).exists():
+            # all distribs are CANCELED
+            self.state = DISTRIB_STATES.CANCELED
+        elif queryset.filter(state=DISTRIB_STATES.SENDING).exists():
+            # if at least one distrib is SENDING
+            self.state = DISTRIB_STATES.SENDING
+        elif queryset.filter(state=DISTRIB_STATES.READY).exists():
+            # if at least one distrib is READY,
+            self.state = DISTRIB_STATES.READY
+        else:
+            # all distribs are DONE
+            self.state = DISTRIB_STATES.DONE
+
+        self.save()
+
+    def mark_as_deleted(self):
+        for distrib in self.get_all_distribs():
+            distrib.mark_as_deleted()
+        self.is_deleted = True
+        self.save()
+
+    def lock(self):
+        self.is_locked = True
+        self.save()
+
+    def unlock(self):
+        self.is_locked = False
+        self.save()
+
+    def manage_campaigns(self):
+        """
+        For each employee, get his paper documents.
+
+        - create a campaign for each organization found (sender_organization_id), with options:
+        - send_option (parcel or personal delivery)
+        - add paper documents to campaigns
+        - commit campaigns
+
+        If project regroup_paper_mailing is True, send a merge of employee paper documents.
+        !! If regroup_paper_mailing is True and send_option is parcel delivery;
+        if an employee has more than one organization, do not merge paper documents.
+        If regroup_paper_mailing is True and send_option is personal delivery;
+        if an employee has more than one organization, choose a random org.
+        Exceptions are not caught (transaction managed on the view).
+        """
+        from rh2.apps.account.models import RH2User
+        from rh2.apps.document.models import DISTRIB_DOC_STATUS, DOC_FORMAT
+
+        sae_service = SAEService(host=settings.SAE_HOST)
+
+        ## Get employees
+        document_queryset = self.get_all_docs().filter(distribution_status=DISTRIB_DOC_STATUS.SUCCESS,
+                                                       format=DOC_FORMAT.PAPER)
+        owner_ids = document_queryset.filter(owner_id__isnull=False
+                                    ).values_list('owner_id', flat=True
+                                    ).order_by('owner_id').distinct()
+        employees = RH2User.objects.employees().filter(pk__in=owner_ids, profile__site=self.site)
+
+        campaigns = {}
+        campaigns_log = {}
+        counters = {}
+
+        logger.info('[Delivery campaign create] Create delivery campaign for distribution project %s on site %s' % (self.pk, self.site))
+        for i, employee in enumerate(employees):
+            # get employee paper docs ordered for grouping
+            employee_documents = document_queryset.filter(owner_id=employee.pk
+                                                 ).order_by('-distribution__distribution_type__is_front_page_for_paper_mail',
+                                                            'cdate')
+            # more than one org ?
+            more_than_one_org = employee_documents.filter(sender_organization_id__isnull=False
+                                                 ).values_list('sender_organization_id', flat=True
+                                                 ).order_by('sender_organization_id'
+                                                 ).distinct().count() > 1
+            # group if regroup_paper_mailing is True and (personal delivery or parcel delivery and only one org)
+            please_group_docs = self.regroup_paper_mailing and (self.delivery_option == DELIVERY_OPTIONS.PERSONAL
+                                                                or not more_than_one_org)
+            # check organization for each doc
+            for j, doc in enumerate(employee_documents):
+                ## Create campaign ?
+                org_id = doc.sender_organization_id
+                if org_id not in campaigns:
+                    # Set org address as recipient if parcel delivery
+                    delivery_service = DeliveryService(host=settings.DELIVERY_HOST)
+                    delivery_service.create_mail_campaign(
+                        0,
+                        self.site.domain,
+                        package_recipient=(self.delivery_option == DELIVERY_OPTIONS.PARCEL and doc.sender_organization.recipient_info or None),
+                        properties=self.delivery_paper_conf.get_delivery_map(),
+                    )
+                    campaigns[org_id] = delivery_service
+                    # logging
+                    campaigns_log[org_id] = DeliveryCampaignLog.objects.create(
+                        project=self,
+                        campaign_id=campaigns[org_id].id_campaign,
+                        organization_id=org_id,
+                        delivery_option=self.delivery_option,
+                    )
+
+                ## Add documents if not grouping
+                if not please_group_docs:
+                    # add doc, recipient is always the employee
+                    # (parcel campaigns already have the organization address)
+                    # if employee address in not valid, take org address
+                    if employee.has_valid_paper_mail_address:
+                        recipient = employee.recipient_info
+                    else:
+                        recipient = doc.sender_organization.recipient_info
+                    counters.setdefault(org_id, 0)
+                    counters[org_id] += 1
+                    campaigns[org_id].add_paper_mail_to_campaign(
+                        recipient,
+                        site=self.site,
+                        counter=counters[org_id],
+                        file_url=sae_service.get_document_url(doc.sae_id,
+                                                              document_type='original')
+                    )
+                    ## logging
+                    DeliveryMailLog.objects.create(
+                        campaign=campaigns_log[org_id],
+                        grouping=False,
+                        user_id=employee.pk,
+                        doc_count=1,
+                        doc_pages=doc.pages,
+                        distribution=doc.distribution,
+                    )
+
+            ## Add merged documents if grouping and conditions satisfied
+            if employee_documents.exists() and please_group_docs:
+                org_id = employee_documents[0].sender_organization_id
+                counters.setdefault(org_id, 0)
+                counters[org_id] += 1
+                if self.delivery_option == DELIVERY_OPTIONS.PERSONAL and employee.has_valid_paper_mail_address:
+                    recipient = employee.recipient_info
+                else:
+                    recipient = employee_documents[0].sender_organization.recipient_info
+                campaigns[org_id].add_paper_mail_to_campaign(
+                    recipient,
+                    site=self.site,
+                    counter=counters[org_id],
+                    file_url=sae_service.get_documents_url(employee_documents,
+                                                           document_type='original')
+                )
+                ## logging
+                DeliveryMailLog.objects.create(
+                    campaign=campaigns_log[org_id],
+                    grouping=True,
+                    user_id=employee.pk,
+                    doc_count=employee_documents.count(),
+                    doc_pages=sum([doc.pages for doc in employee_documents]),
+                    distribution=None,
+                )
+
+        ## Commit campaigns
+        logger.info('[Delivery campaign commit] Preparing delivery campaign commit for distribution project %s on site %s' % (self.pk, self.site))
+        for campaign in campaigns.values():
+            campaign.commit_mail_campaign()
+
+    @transition(field=state, source=DISTRIB_STATES.READY, target=DISTRIB_STATES.BUILDING_CAMPAIGNS, save=True)
+    def confirm(self, sender=None):
+        """
+        Project validation.
+        Just change project state to BUILDING_CAMPAIGNS
+        and launch async task to build campaigns.
+        """
+        distributions = self.get_all_distribs().filter(state=DISTRIB_STATES.READY)
+        # Change distribution state
+        distributions.update(state=DISTRIB_STATES.BUILDING_CAMPAIGNS)
+
+        if settings.TESTS_RUNNING:
+            return
+
+        # project state is not yet changed; project id in arg instead of instance
+        build_campaigns.apply_async(args=(self.pk, sender),
+                                    countdown=3)
+
+    @transition(field=state, source=DISTRIB_STATES.BUILDING_CAMPAIGNS, target=DISTRIB_STATES.SENDING, save=True)
+    def build_campaigns(self, sender=None):
+        """
+        Project validation.
+        For each related distribution (ready and not deleted)
+        0 Record Validation date
+        1 Archive docs
+        2 Create and commit campaigns
+        Then, send a global notification to managers
+        """
+        from rh2.apps.account.models import RH2User
+        from rh2.apps.dashboard.models import UserStatistics
+
+        distributions = self.get_all_distribs().filter(state=DISTRIB_STATES.BUILDING_CAMPAIGNS)
+        distributions_count = distributions.count()
+        if not settings.TESTS_RUNNING:
+            for distribution in distributions:
+                # Update SAE status of each doc
+                archive_docs_on_sae.delay(distribution=distribution, site=self.site)
+
+        # Manage campaigns
+        self.manage_campaigns()
+
+        # Change distribution state
+        distributions.update(state=DISTRIB_STATES.SENDING)
+
+        # update some project fields.
+        self.validated_date = now()
+        self.save()
+
+        # stats manager, done distribution
+        if sender:
+            statistics, created = UserStatistics.objects.get_or_create(user=sender)
+            statistics.done_distributions += distributions_count
+            statistics.save()
+
+            # Send notification to all managers who can manage distribs
+            recipients = self.get_managers_to_notice()
+            # no need to call send_async, as we already are in an async task
+            notification.send(recipients, "pe_distribution_project_confirmed", {
+                "project": self,
+            }, sender=sender)
+            logger.info('[Distrib project] Confirmed project notification sent to %s managers on domain %s' % (len(recipients), self.site))
+
+    @transition(field=state, source=DISTRIB_STATES.SENDING, target=DISTRIB_STATES.DONE, save=True)
+    def finish(self):
+        """
+        All mails and emails are sent, we are done.
+        Mark all distribs as finished
+        """
+        distributions = self.get_all_distribs().filter(state=DISTRIB_STATES.SENDING)
+        distributions.update(state=DISTRIB_STATES.DONE)
+
+        self.is_mail_campaign_done = True
+        self.is_locked = False
+        self.save()
+        MailFactory.mail_admins('distribution_project_finished_sit',
+            context = {'project': self,
+                       'site': self.site})
+
+
+class Distribution(models.Model, DistributionMixins):
+    """
+    RH2 distribution process model.
+
+    Distribution states (FSMField)
+    - flow validation pending
+    - manager validation pending
+    - flow validation error
+    - sending notification
+    - canceled
+    - done
+
+    """
+    project = models.ForeignKey(
+        Project,
+        limit_choices_to={'site': RH2Site.objects.get_current},
+    )
+
+    uuid = models.CharField(_(u"uuid"), max_length=36, db_index=True, unique=True)
+    name = models.CharField(_(u"title"), max_length=50)
+    distribution_type = models.ForeignKey(
+        'distribution.DistributionType',
+        verbose_name=_('distribution type'),
+        limit_choices_to={'site': RH2Site.objects.get_current},
+    )
+
+    state = FSMField(_('state'),
+                     choices=DISTRIB_STATES.CHOICES,
+                     default=DISTRIB_STATES.FLOW_PENDING,
+                     db_index=True)
+    # How long did flow took to process this distribution
+    callback_flow_duration = models.IntegerField(_('flow distribution process duration'), blank=True, null=True)
+    callback_flow_error_count = models.IntegerField(_('number of errors returned by flow callbacks'), blank=True, null=True)
+    callback_flow_success_count = models.IntegerField(_('number of sucesses returned by flow callbacks'), blank=True, null=True)
+    end_callback_flow_date  = models.DateTimeField(_('Flow end callback date'), null=True, blank=True)
+
+    sae_id = models.CharField(_(u"sae ref"), max_length=100, unique=True, null=True, blank=True)
+    sae_ref_ids = JSONField('Sae ref ids from flow callback', null=True, blank=True)
+    distribution_option = models.IntegerField(_('distribution option'), choices=DISTRIBUTION_CHOICES.CHOICES, blank=True, null=True)
+    source_file = models.FileField(_('source file'), upload_to="distributions/%Y/%m/%d", max_length=255)
+    report_file = models.FileField(_('CSV report'), upload_to="distributions/csv_report/%Y/%m/%d", max_length=255, blank=True, null=True)
+    is_report_ready = models.BooleanField(_('report is ready'), default=False)
+    email_complementary = models.TextField(blank=True,
+                                           help_text=_("Message included in the notification email received by employees and employers."))
+    cdate = models.DateTimeField(_('creation date'), auto_now_add=True)
+    udate = models.DateTimeField(_('update date'), auto_now=True)
+    is_deleted = models.BooleanField(default=False, db_index=True)
+
+    # Keep track of how many docs have been integrated from flow callback tasks (celery)
+    count_integrated_docs = models.IntegerField(default=0,
+                                                help_text='Keep track of how many docs have been integrated from flow callback tasks')
+
+    def __unicode__(self):
+        return u"%s %s" % (self.name, self.distribution_type)
+
+    def save(self, *args, **kwargs):
+        if not self.pk:
+            self.uuid = str(uuid.uuid4())
+        super(Distribution, self).save(*args, **kwargs)
+
+    @property
+    def site(self):
+        return self.project.site
+
+    @transition(field=state, source=DISTRIB_STATES.FLOW_PENDING, target=DISTRIB_STATES.INTEGRATING_DOCS_TO_PEOPLEDOC, save=True)
+    def flow_done(self, end_flow_callback_data):
+        """
+        Flow validated tells us that all tasks regarding the current
+        distribution have been pushed on the distribution_callback queue.
+
+        It gives us a list of temporary refs that we will store and use
+        compare to each callback to track progress until all task are done.
+        """
+        data = end_flow_callback_data
+        self.callback_flow_duration = data['duration']
+        self.callback_flow_success_count = data['count_success']
+        self.callback_flow_error_count = data['count_error']
+        # Store temp ref ids as a JSON dic
+        self.sae_ref_ids = data['refs']
+
+    @transition(field=state, source=DISTRIB_STATES.INTEGRATING_DOCS_TO_PEOPLEDOC, target=DISTRIB_STATES.MANAGER_PENDING, save=True)
+    def flow_validate(self):
+        """
+        1. Send email requesting an active confirmation
+           to all managers with role send_mail_for_pending_distribution
+        """
+        # Get roles with send_mail_for_pending_distribution true
+        elected_roles = Role.objects.filter(send_mail_for_pending_distribution=True,
+                                            site=self.project.site)
+        # Collect emails
+        user_emails = {}
+        for role in elected_roles:
+            orgprofiles = role.orgprofile_set.all()
+            for orgprofile in orgprofiles:
+                email = orgprofile.user.email
+                user_emails[email] = orgprofile.user
+
+        # send_mails to managers
+        url = reverse('distribution:distribution_document_search', args=[self.project.pk, self.pk])
+        for mail, user in user_emails.iteritems():
+            MailFactory.mail('distribution_manager_confirmation',
+                emails=[mail],
+                context = {'distribution': self,
+                           'user': user,
+                           'url': 'https://%s%s' % (self.site.domain, url),
+                           'site': self.site})
+
+        ## report generation
+        # pre signal
+        signals.pre_csv_generation.send(sender=self)
+        # generate filename
+        tmp_filename = u'%s_%s_%s' % (self.site.domain,
+                                          self.name,
+                                          now().strftime('%d-%m-%y-at-%Hh%M'))
+        tmp_filename = "%s.csv" % (self.report_file.field.generate_filename(self.report_file.instance, slugify(tmp_filename)))
+        # write csv
+        tmp_file = tempfile.NamedTemporaryFile()
+        writer = UnicodeWriter(tmp_file, delimiter=';', quotechar="'")
+        self.build_csv_report(writer)
+        # save file
+        self.report_file = File(tmp_file, name=tmp_filename)
+        self.is_report_ready = True
+        # post signal
+        signals.post_csv_generation.send(sender=self)
+
+        ## Set flow end callback date
+        self.end_callback_flow_date = now()
+        self.save()
+
+    @transition(field=state, source=DISTRIB_STATES.FLOW_PENDING, target=DISTRIB_STATES.FLOW_ERROR, save=True)
+    def flow_invalidate(self):
+        """
+        Call back from flow do NOT validate the distribution data
+        """
+        pass
+
+    @transition(field=state, source=DISTRIB_STATES.MANAGER_PENDING, target=DISTRIB_STATES.CANCELED, save=True)
+    def cancel(self):
+        """
+        Manager cancel the distribution, we should remove all documents linked to
+        the distribution.
+        """
+        # TODO SAEClient call deleting documents
+        pass
+
+    @transition(field=state, source=DISTRIB_STATES.MANAGER_PENDING, target=DISTRIB_STATES.READY, save=True)
+    def confirm(self):
+        """
+        Just mark the distribution as ready.
+        """
+        pass
+
+    def mark_as_deleted(self):
+        """
+        Manager delete the distribution at anytime he wants:
+        We set is_deleted to True and launch an async task that will
+        delete all linked documents.
+        """
+        self.is_deleted = True
+        self.save()
+        if settings.TESTS_RUNNING:
+            delete_docs.apply(kwargs={'distribution': self})
+        else:
+            delete_docs.delay(distribution=self)
+
+    def turn_distrib_docs_visible(self, reindex=False):
+        """
+        Only turn visible digital doc employee copies where
+        The employee should exist.
+        For now we use a loop but we could try to do this check
+        with ORM/raw SQL if it gets too slow.
+        - Enterprise copies
+        - Employee copies
+        """
+        from rh2.apps.search.tasks import reindex_docs
+        # Turn distributed docs to visible
+        enterprise_copies = self.get_enterprise_copies()
+        enterprise_copies.update(is_visible=True)
+        count_ent_copies = enterprise_copies.count()
+
+        # Do we want to turn original documents visible ?
+        employee_copies = self.get_electronic_employee_doc_copies(include_original=False)
+        employee_copies.update(is_visible=True)
+        count_emp_copies = employee_copies.count()
+
+        # Start ES indexing for enterprise & employee documents since an update does
+        # not trigger post_save signals
+        if reindex and not settings.TESTS_RUNNING:
+            reindex_docs.apply(kwargs=dict(site=self.site, kwfilters={'distribution': self}))
+        logger.info('[Distrib] turn_distrib_docs_visible: %s employee doc(s) & %s enterprise doc(s) processed' % (count_emp_copies, count_ent_copies))
+
+    def is_cancelable(self):
+        return self.state == DISTRIB_STATES.MANAGER_PENDING
+
+    def is_waiting_for_flow_callbacks(self):
+        return self.state == DISTRIB_STATES.FLOW_PENDING
+
+    def is_waiting_for_flow_tasks(self):
+        return self.state == DISTRIB_STATES.INTEGRATING_DOCS_TO_PEOPLEDOC
+
+    def is_waiting_for_manager_confirmation(self):
+        return self.state == DISTRIB_STATES.MANAGER_PENDING
+
+    def doc_type_active_dynattrs(self):
+        return self.distribution_type.doc_type.active_dynattrs.all()
+
+    def doc_type_metadata(self):
+        return self.distribution_type.doc_type.metadata_set.all()
+
+    def are_flow_callbacks_done(self):
+        """
+        Compare count_integrated_docs to length of sae_ref_ids and
+        return True if they are equal.
+        """
+        if self.count_integrated_docs == 0:
+            return False
+        if not 'refs' in self.sae_ref_ids:
+            return False
+        return self.count_integrated_docs >= self.sae_refs_length
+
+    @property
+    def sae_refs_length(self):
+        if not self.sae_ref_ids:
+            return 0
+        return len(self.sae_ref_ids['refs'])
+
+    @property
+    def sae_json_metadata(self):
+        return {
+            'type': 'DISTRIBUTION',
+            'distrib_uuid': self.uuid,
+            'distrib_name': self.name,
+            'distrib_type_name': self.distribution_type.name,
+            'distrib_type_doc_type_id': self.distribution_type.doc_type.pk,
+            'distrib_type_doc_type_name': self.distribution_type.doc_type.name,
+            'distrib_type_doc_type_code': self.distribution_type.doc_type.code,
+            'distrib_type_doc_type_type': self.distribution_type.doc_type.category,
+            'site_domain': self.site.domain,
+        }
+
+    @property
+    def total_docs_expected(self):
+        """
+        Return the length of ref list in sae_ref_ids
+        """
+        if not self.sae_ref_ids:
+            return 0
+        return len(self.sae_ref_ids['refs'])
+
+    @property
+    def employee_document_success_map(self):
+        """
+        Return a map of employee_id/[sae_refs] of all paper copies from
+        the distribution.
+        """
+        from rh2.apps.account.models import RH2UserProfile
+        data = {}
+        for document in self.get_paper_employee_doc_copies():
+            data.setdefault(document.owner_id, {'sae_ids': [],
+                                                'first_name': document.owner_first_name.title(),
+                                                'last_name': document.owner_last_name.upper(),
+                                                'address1': document.owner_address,
+                                                'address2': document.owner_address_2,
+                                                'address3': document.owner_address_3,
+                                                'postcode': document.owner_postcode,
+                                                'city': document.owner_city,
+                                                'country': document.owner_country,
+                                                'lang': None})
+            # set lang only if not set
+            if data[document.owner_id]['lang'] is None:
+                data[document.owner_id]['lang'] = 'fr'
+                try:
+                    if document.owner:
+                        data[document.owner_id]['lang'] = document.owner.get_profile().language
+                except RH2UserProfile:
+                    pass
+            # add doc sae ref
+            data[document.owner_id]['sae_ids'].append(document.sae_id)
+        return data
+
+    def upload_to_sae(self):
+        sae_service = SAEService(host=settings.SAE_HOST)
+        site_prefs = self.site.get_prefs()
+        params = {
+            'path_to_file': self.source_file.path,
+            'account_id': site_prefs.sae_enterprise_id,
+            'json_metadata': self.sae_json_metadata,
+            'storage_profile': 'SAE'
+        }
+        sae_result = sae_service.upload_document(**params)
+        # Persist sae id
+        self.sae_id = sae_result['reference']
+        self.save()
+
+    def archive_documents_on_sae(self):
+        """
+        Call SAE to archive documents.
+        """
+        # Collect SAE refs
+        sae_refs = self.document_set.values_list('sae_id', flat=True)
+        sae_service = SAEService(host=settings.SAE_HOST)
+        try:
+            sae_service.archive_documents(list(sae_refs))
+        except SAEError, e:
+            # Send mail to admins
+            MailFactory.mail_admins('distribution_archiving_failure',
+                context = {'distribution': self, 'error': e, 'site': self.site, 'sae_refs': sae_refs })
+            raise e
+
+    def get_all_docs(self):
+        """
+        Return a Document queryset
+        - document linked to the distribution
+        - employee document
+        - document is not deleted
+        """
+        from rh2.apps.document.models import DOC_ORIGIN, DOC_TYPE_CATEGORIES
+        return self.document_set.filter(origin__in=DOC_ORIGIN.PEOPLEDOC_DISTRIB_DICT.keys(),
+                                        doc_type__category=DOC_TYPE_CATEGORIES.EMPLOYEE,
+                                        date_delete__isnull=True,
+                                        site=self.project.site)
+
+    def get_all_delivery_logs(self):
+        """
+        Return all delivery logs for the distribution.
+        """
+        return DeliveryMailLog.objects.filter(distribution=self)
+
+    def inform_flow(self):
+        """
+        Do a FLOW POST to process the distribution (lxp file and so on)
+        """
+        prefs = self.site.get_prefs()
+        flow_service = FlowService(host=settings.FLOW_HOST,
+                                   sae_enterprise_id=prefs.sae_enterprise_id,
+                                   sae_employee_id=prefs.sae_employee_id)
+        return flow_service.process_distribution(self, is_test=settings.TESTS_RUNNING)
+
+
+    def mails_admins_flow_ready(self, manager):
+        """
+        Inform SIT that FLOW is waiting for them to start their routine
+        """
+        MailFactory.mail_admins('distribution_created_sit',
+            context = {'distribution': self, 'manager': manager, 'site': self.site})
+
+    def get_flow_meta_dic_schema(self):
+        """
+        call doctype get_flow_meta_dic_schema
+        """
+        return self.distribution_type.get_flow_meta_dic_schema()
+
+    def build_csv_report(self, writer):
+        """
+        Build CSV distribution report.
+        Should be generated only if state is not FLOW_PENDING.
+        (to be checked in view)
+        """
+        from rh2.apps.enterprise.models import Organisation
+        writer.writerow([_(u'Name'),
+                         _(u'First name'),
+                         _(u'Registration nbr'),
+                         _(u'Org. code'),
+                         _(u'Employee active'),
+                         _(u'Elec Subscriber'),
+                         _(u'Doc type'),
+                         _(u'Doc title'),
+                         _(u'Doc pages'),
+                         _(u'Doc SAE ref'),
+                         _(u'Doc Internal ID'),
+                         _(u'Date'),
+                         _(u'Doc elec employee'),
+                         _(u'Doc paper employee'),
+                         _(u'Doc enterprise'),
+                         _(u'Error code'),
+                         _(u'Error message'),
+                         _(u'Copy type')])
+
+        for document in self.document_set.all():
+            writer.writerow([document.owner_last_name,
+                             document.owner_first_name,
+                             ", ".join(document.owner_registration_numbers),
+                             ", ".join(list(Organisation.objects.filter(site=self.site, pk__in=document.owner_organizations).values_list('code', flat=True))),
+                             document.owner and str(int(document.owner.is_active)) or '',
+                            str(int(document.user_subscribed_on_create)),
+                            document.doc_type.name,
+                            document.title,
+                            str(document.pages),
+                            document.sae_id,
+                            str(document.id),
+                            document.cdate.strftime('%d-%m-%y-at-%Hh%M'),
+                            str(int(document.is_electronic_employee_distrib_copy)),
+                            str(int(document.is_paper_employee_distrib_copy)),
+                            str(int(document.is_enterprise_distrib_copy)),
+                            document.distrib_error_code and str(document.distrib_error_code) or '',
+                            document.distrib_error_message,
+                            document.is_original and 'original' or 'duplicate'])
+
+models.signals.post_save.connect(signals.distrib_post_save, sender=Distribution)
+
+
+class DistributionType(models.Model):
+    """
+    Admin preferences for a DocType subscription.
+
+    """
+    doc_type = models.ForeignKey('document.DocType',
+                                 verbose_name=_('document type'),
+                                 limit_choices_to={'site': RH2Site.objects.get_current, 'category': 'employee'},
+                                 help_text=_('document type'))
+
+    name = models.CharField(_('name'), max_length=50)
+
+    site = models.ForeignKey(RH2Site, default=RH2Site.objects.get_current, editable=False)
+    # Is the document created from this distribution type going to be the first document
+    # of a multi distribution paper stack when sent by paper mail "porte adresse"
+    is_front_page_for_paper_mail = models.BooleanField(_('first when merged in a project'), default=False, help_text=_('Is this document the fist page of a multi distribution doc aggregation when sent by paper mail ?'))
+
+    # crop value (in %)
+    crop_size = models.IntegerField(_('crop size'), default=settings.GLIMPSE_CROP_SIZE)
+
+    receivers = models.IntegerField(_('receivers targeted by the distribution'), choices=DISTRIB_RECEIVERS.CHOICES, default=1)
+    is_history_import = models.BooleanField(_('is history import'), default=False,
+                                            help_text=_("Remove the 'new' flag on new documents in CFE"))
+
+    # internal SIT config linked to a client and a doc_type, used to configure flow
+    config_id = models.CharField(_('flow config id'), help_text=_('Internal SIT config id used by FLOW'), max_length=50)
+
+    # API flags for flow 'flow_search_employees'
+    check_first_name_on_employee_lookup = models.BooleanField(help_text=_('Try to find the employee firstname in the firstname and lastname returned by flow'), default=True)
+    check_last_name_on_employee_lookup = models.BooleanField(help_text=_('Try to find the employee lastname in the firstname and lastname returned by flow'), default=True)
+    check_organisation_on_employee_lookup = models.BooleanField(help_text=_('Try to get the employee registration reference using the registration number without the organisation number as a filter'), default=True)
+    send_emails_and_notifications_on_validation = models.BooleanField(help_text=_('Send notifications by email and the wall of our users upon validation'), default=True)
+
+    # FLow disitribution parameter
+    employee_CFE_account_not_activated = models.IntegerField(_('Employee CFE account is not activated'), choices=DISTRIB_MEDIAS.CHOICES, default=1,
+        help_text=_("What should be the distribution mode when the employee vault is not activated"))
+    employee_choice_not_done = models.IntegerField(_('Employee CFE is activated, but choice is not done or not required'), choices=DISTRIB_MEDIAS.CHOICES, default=1,
+        help_text=_("What should be the distribution mode when the employee vault is activated, but the choice is not done or not required (depending on the document type)"))
+    employee_chose_electronic = models.IntegerField(_('Employee choice is electronique'), choices=DISTRIB_MEDIAS.CHOICES, default=1,
+        help_text=_("What should be the default distribution mode when the employee chose ELECTRONIC"), blank=True, null=True)
+    employee_chose_paper = models.IntegerField(_('Employee choice is paper'), choices=DISTRIB_MEDIAS.CHOICES, default=2,
+        help_text=_("What should be the default distribution mode when the employee chose PAPER"), blank=True, null=True)
+
+    def __unicode__(self):
+        return self.name
+
+    class Meta:
+        ordering = ['name']
+
+    def get_distribution_channels_for_user(self, user):
+        """
+        Distrib Matrice rights: Lookup table to find user values
+        for is_elec and is_paper. We need to look at several things to decide
+        whether the employee should receive electronic, paper, both
+        or none of the documents copies.
+        @return is_elec, is_paper
+        """
+        ## Look if an employee has a subscription profile for
+        # this distribution type.
+        from rh2.apps.account.models import SubscriptionProfile
+
+        elec_paper = (True, True)
+        elec_and_not_paper = (True, False)
+        not_elec_and_paper = (False, True)
+        nothing = (False, False)
+
+        # If it's an enterprise distribution we do not
+        # distribute employee documents therefore no Elec
+        # and no Paper
+        if self.receivers == DISTRIB_RECEIVERS.ENTERPRISE:
+            return nothing
+
+        # Check if user is gone if so we always return paper
+        # for non enterprise distribution
+        if user.get_profile().is_gone:
+            return not_elec_and_paper
+
+        # Check if distributions are freezed for this employee
+        if user.get_profile().distributions_freezed:
+            return nothing
+
+        # First check if the user account is active
+        if not user.is_active:
+            not_active = self.employee_CFE_account_not_activated
+            return self._distribution_receivers_to_bool_tuple(not_active)
+
+        # Check doctype flag 'prompt_distrib_choice_for_employee'
+        if not self.doc_type.prompt_distrib_choice_for_employee:
+            return self._distribution_receivers_to_bool_tuple(self.employee_choice_not_done)
+
+        # Get subscription profile
+        try:
+            sub_profile = SubscriptionProfile.objects.get(
+                user=user,
+                doc_type=self.doc_type
+            )
+        except SubscriptionProfile.DoesNotExist:
+            # If no sub_profile we look at distribution_type.employee_choice_not_done
+            return self._distribution_receivers_to_bool_tuple(self.employee_choice_not_done)
+        else:
+            if sub_profile.is_demat == None:
+                return self._distribution_receivers_to_bool_tuple(self.employee_choice_not_done)
+
+            ## If sub_profile demat is True we look at distribution_type.employee_chose_electronic
+            if sub_profile.is_demat == True:
+                emp_chose_elec = self.employee_chose_electronic
+                return self._distribution_receivers_to_bool_tuple(emp_chose_elec)
+
+            ## If False we look at distribution_type.employee_chose_paper
+            if sub_profile.is_demat == False:
+                emp_chose_paper = self.employee_chose_paper
+                return self._distribution_receivers_to_bool_tuple(emp_chose_paper)
+
+        return nothing
+
+    def get_distribution_channels_for_user_display(self, user):
+        """
+        Return tuple (code, display)
+        Used in templates, as css class
+        """
+        is_elec, is_paper = self.get_distribution_channels_for_user(user)
+        if not is_elec and not is_paper:
+            return ("none", _("No sending"))
+        if is_elec and not is_paper:
+            return ("elec", _("Electronic"))
+        if not is_elec and is_paper:
+            return ("paper", _("Paper"))
+        return ("both", _("Electronic and paper"))
+
+    def get_distribution_originals_for_user(self, user):
+        """
+        Get original params for Flow, to determine if the elec/paper copy is an original.
+        elec and paper copy can not be both originals.
+        @return is_elec_original, is_paper_original
+        """
+        is_elec, is_paper = self.get_distribution_channels_for_user(user)
+        if is_paper:
+            return False, True
+        if is_elec and not is_paper:
+            return True, False
+        return False, False
+
+    def _distribution_receivers_to_bool_tuple(self, distrib_type_var):
+        """
+        Elec, Paper
+        """
+        if distrib_type_var == DISTRIB_MEDIAS.NONE:
+            return False, False
+        elif distrib_type_var == DISTRIB_MEDIAS.ELECTRONIC:
+            return True, False
+        elif distrib_type_var == DISTRIB_MEDIAS.PAPER:
+            return False, True
+        return True, True
+
+    def get_flow_meta_dic_schema(self):
+        """
+        Return a JSON schema representing METAS to be
+        digested by FLOW, i.e::
+
+            {
+              'doctype_metas': [{
+                    'code': '[string]',
+                    'type': '[int|text|date|list]',
+                    'allowed_values': [string] (only for type 'list', default is empty),
+                    'required': [true/false],
+                }, ...],
+              'doc_filters': [{
+                    'code': '[string]',
+                    'type': '[int|bool|string]',
+                    'allowed_values': '[string|true/false]',
+                    'default': [default value]
+
+               }, ...]
+            }
+
+        """
+        doc_type_metadatas = self.doc_type.metadata_set.all()
+        doc_type_active_dynattrs = self.doc_type.active_dynattrs.all()
+        data = {
+            "doctype_metas": [],
+            "doc_filters": [],
+        }
+        for doc_type_meta in doc_type_metadatas:
+            d = {
+                'code': doc_type_meta.code,
+                'type': doc_type_meta.data_type,
+                'allowed_values': doc_type_meta.get_values(),
+                'required': doc_type_meta.mandatory
+            }
+            data['doctype_metas'].append(d)
+        # filters
+        for dynattr in doc_type_active_dynattrs:
+            d = {
+                'code': dynattr.code,
+                'type': dynattr.field_type,
+                'allowed_values': dynattr.allowed_values,
+                'default': dynattr.default_value
+            }
+            data['doc_filters'].append(d)
+        return data
+
+models.signals.post_save.connect(signals.distrib_type_post_save, sender=DistributionType)
+
+
+class DeliveryCampaignLog(models.Model):
+    project = models.ForeignKey(Project)
+    campaign_id = models.IntegerField(_('campaign id'))
+    organization_id = models.IntegerField(_('organization id'))
+    delivery_option = models.CharField(_('delivery options'),
+                                       max_length=10,
+                                       choices=DELIVERY_OPTIONS.CHOICES)
+
+
+class DeliveryMailLog(models.Model):
+    campaign = models.ForeignKey(DeliveryCampaignLog)
+    grouping = models.BooleanField(_('grouping'))
+    user_id = models.IntegerField(_('employee id'))
+    doc_count = models.IntegerField(_('number of documents in the mail'))
+    doc_pages = models.IntegerField(_('number of pages in the mail'))
+    distribution = models.ForeignKey(Distribution, null=True, blank=True)
+

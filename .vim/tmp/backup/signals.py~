@@ -1,0 +1,18 @@
+
+def task_pre_save(sender, instance, **kwargs):
+    """
+    When a task is created, if sender exists, store some sender attributes on the document.
+    """
+    if instance.is_dirty():
+        dirty_fields = instance.get_dirty_fields()
+        # update sender fields
+        if 'sender_id' in dirty_fields or instance.pk is None:
+            if instance.sender_id is None:
+                # clear fields
+                instance.sender_first_name = ''
+                instance.sender_last_name = ''
+            else:
+                # fill fields
+                instance.sender_first_name = instance.sender.first_name
+                instance.sender_last_name = instance.sender.last_name
+
