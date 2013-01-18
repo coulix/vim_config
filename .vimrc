@@ -208,6 +208,8 @@ cnoreabbrev W w
 " List the fixmes/todos in the current directory.
 nnoremap <leader>0 :vimgrep /TODO\\|FIXME/ **/*<CR>:cw<CR>
 
+imap jj <Esc>
+
 " Folding {{{
 
 " Unfold all the document
